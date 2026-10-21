@@ -1,0 +1,98 @@
+// The configuration file: what it accepts and how it says what is wrong.
+
+import std/time;
+import config;
+
+const GOOD: string = `zone = "UTC"
+state = "var/raycron.state"
+notify = false
+
+[[job]]
+name = "backup"
+schedule = "30 2 * * *"
+command = ["rsync", "-a", "src/", "dst/"]
+timeout = "10m"
+overlap = "queue"
+catch_up = true
+
+[[job]]
+name = "report"
+schedule = "@daily"
+command = "make report > out.txt"
+dir = "/srv"
+`;
+
+@test
+fn a_good_configuration() {
+    let c = config.parse(GOOD, "/etc/raycron/raycron.toml").unwrap();
+    assert_eq(c.zone.name, "UTC");
+    assert_eq(c.state, "/etc/raycron/var/raycron.state");
+    assert(!c.notify);
+    assert_eq(c.jobs.len(), 2);
+    let b = c.jobs[0];
+    assert_eq(b.name, "backup");
+    assert_eq(b.command, ["rsync", "-a", "src/", "dst/"]);
+    assert_eq(b.timeout_ms, time.minutes(10));
+    assert_eq(b.overlap, "queue");
+    assert(b.catch_up);
+    assert_eq(b.dir, "/etc/raycron");
+    let r = c.jobs[1];
+    // A string runs through the shell; defaults: skip, one hour, no catch-up.
+    assert_eq(r.command, ["sh", "-c", "make report > out.txt"]);
+    assert_eq(r.overlap, "skip");
+    assert_eq(r.timeout_ms, time.hours(1));
+    assert(!r.catch_up);
+    assert_eq(r.dir, "/srv");
+}
+
+fn error_of(src: string) -> string {
+    match (config.parse(src, "/x/raycron.toml")) {
+        Result.Ok(_) => panic("accepted: ${src}"),
+        Result.Err(e) => e,
+    }
+}
+
+fn job(body: string) -> string {
+    "zone = \"UTC\"\n[[job]]\nname = \"j\"\n${body}\n"
+}
+
+@test
+fn mistakes_are_named() {
+    assert(error_of("zone = \"UTC\"\nnotfy = true\n").contains("unknown setting 'notfy'"));
+    assert(
+        error_of(job("schedule = \"* * * * *\"\ncommand = [\"true\"]\ntimout = \"1m\"")).contains(
+            "unknown setting 'job.0.timout'"
+        )
+    );
+    assert(error_of(job("schedule = \"61 * * * *\"\ncommand = [\"true\"]")).contains("job 'j'"));
+    // 31 February never comes.
+    assert(error_of(job("schedule = \"0 0 31 2 *\"\ncommand = [\"true\"]")).contains("job 'j'"));
+    assert(error_of(job("schedule = \"* * * * *\"")).contains("command: missing"));
+    assert(error_of(job("schedule = \"* * * * *\"\ncommand = []")).contains("empty command"));
+    assert(
+        error_of(job("schedule = \"* * * * *\"\ncommand = [\"true\"]\noverlap = \"kill\"")).contains(
+            "overlap must be"
+        )
+    );
+    assert(
+        error_of(job("schedule = \"* * * * *\"\ncommand = [\"true\"]\ntimeout = \"10 minutes\"")).contains(
+            "not a duration"
+        )
+    );
+    assert(error_of(job("command = [\"true\"]")).contains("missing schedule"));
+    let twice = job("schedule = \"* * * * *\"\ncommand = [\"true\"]")
+        + "[[job]]\nname = \"j\"\nschedule = \"@hourly\"\ncommand = [\"true\"]\n";
+    assert(error_of(twice).contains("defined twice"));
+    assert(error_of("zone = \"Mars/Olympus\"\n").contains("zone"));
+}
+
+@test
+fn durations() {
+    assert_eq(config.parse_duration("90s"), Result.Ok(90000));
+    assert_eq(config.parse_duration("10m"), Result.Ok(600000));
+    assert_eq(config.parse_duration("2h"), Result.Ok(7200000));
+    assert_eq(config.parse_duration("45"), Result.Ok(45000));
+    assert(config.parse_duration("0s").is_err());
+    assert(config.parse_duration("").is_err());
+    assert(config.parse_duration("1d").is_err());
+}

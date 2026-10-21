@@ -1,0 +1,78 @@
+//! The state file (`std/kv`): the last runs of each job, newest first, and when each job last
+//! fired, so a restart knows what it missed.
+
+import std/json;
+import std/kv;
+import runner;
+from runner import Run;
+
+/// Runs kept per job.
+pub const KEEP: int = 20;
+
+fn encode(r: Run) -> string {
+    json.obj()
+        .field("job", r.job)
+        .field("start", r.start_ms)
+        .field("end", r.end_ms)
+        .field("status", r.status)
+        .field("code", r.code)
+        .field("output", r.output)
+        .render()
+}
+
+fn decode(j: json.Json) -> Option<Run> {
+    Option.Some(
+        Run {
+            job: json.get_string(j, "job")?,
+            start_ms: json.get_int(j, "start")?,
+            end_ms: json.get_int(j, "end")?,
+            status: json.get_string(j, "status")?,
+            code: json.get_int(j, "code")?,
+            output: json.get_string(j, "output").unwrap_or("")
+        }
+    )
+}
+
+/// The job's runs, newest first.
+pub fn runs(s: kv.Store, job: string) -> [Run] {
+    let out: [Run] = [];
+    if let Option.Some(text) = s.get_string("runs/${job}") {
+        if let Result.Ok(j) = json.parse(text) {
+            for item in json.as_array(j).unwrap_or([]) {
+                if let Option.Some(r) = decode(item) {
+                    out.push(r);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Adds a run (keeping the newest `KEEP`) and saves.
+pub fn record(s: kv.Store, r: Run) -> Result<int, string> {
+    let all = [r] + runs(s, r.job);
+    let kept = all.slice(0, KEEP);
+    let items = kept.map(fn(x: Run) -> string { encode(x) });
+    s.set_string("runs/${r.job}", "[${join(items, ",")}]");
+    s.save()
+}
+
+/// When the job last fired (its scheduled time, not when it ended).
+pub fn last_fire(s: kv.Store, job: string) -> Option<int> {
+    s.get_string("fired/${job}").and_then(fn(v: string) -> Option<int> { parse_int(v) })
+}
+
+pub fn set_last_fire(s: kv.Store, job: string, ms: int) -> Result<int, string> {
+    s.set_string("fired/${job}", to_string(ms));
+    s.save()
+}
+
+pub fn jobs(s: kv.Store) -> [string] {
+    let out: [string] = [];
+    for k in s.keys() {
+        if let Option.Some(name) = k.strip_prefix("runs/") {
+            out.push(name);
+        }
+    }
+    sort(out)
+}

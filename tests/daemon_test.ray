@@ -1,0 +1,186 @@
+// The scheduler: due jobs, overlap, missed fire times, and a whole night in a few seconds.
+
+import std/fs;
+import std/kv;
+import std/time;
+import config;
+import daemon;
+import history;
+import schedule;
+
+fn utc(y: int, mo: int, d: int, h: int, mi: int, s: int) -> int {
+    time.to_epoch_millis(
+        time.DateTime { year: y, month: mo, day: d, hour: h, minute: mi, second: s, weekday: 0 }
+    )
+}
+
+fn shell(cmd: string) -> string {
+    // A string command runs through `sh -c`; Windows has no sh.
+    if (platform() == "windows") { "[\"cmd\", \"/c\", \"${cmd}\"]" } else { "\"${cmd}\"" }
+}
+
+fn setup(jobs: string, zone: string) -> (config.Config, kv.Store, string) {
+    let dir = fs.make_temp_dir("raycron").unwrap();
+    let path = "${dir}/raycron.toml";
+    let src = "zone = \"${zone}\"\nnotify = false\n${jobs}";
+    fs.write_file(path, src).unwrap();
+    let cfg = config.load(path).unwrap();
+    let store = kv.open(cfg.state).unwrap();
+    (cfg, store, dir)
+}
+
+fn job(name: string, sched: string, cmd: string, extra: string) -> string {
+    "[[job]]\nname = \"${name}\"\nschedule = \"${sched}\"\ncommand = ${shell(cmd)}\n${extra}\n"
+}
+
+/// Waits for `n` runs to finish and hands them to the daemon.
+fn settle(d: daemon.Daemon, n: int) {
+    for _ in 0..n {
+        match (recv(d.events).unwrap()) {
+            daemon.Event.Done(r) => daemon.finished(d, r),
+            daemon.Event.Signal(_) => { },
+        }
+    }
+}
+
+@test
+fn due_jobs_fire_and_move_on() {
+    let (cfg, store, dir) = setup(job("a", "*/5 * * * *", "echo a", ""), "UTC");
+    let start = utc(2026, 10, 21, 10, 2, 0);
+    let d = daemon.new(cfg, store, daemon.virtual_clock(start)).unwrap();
+    assert_eq(d.slots[0].next, utc(2026, 10, 21, 10, 5, 0));
+    assert_eq(daemon.tick(d, start), 0);
+    assert_eq(daemon.tick(d, utc(2026, 10, 21, 10, 5, 1)), 1);
+    assert_eq(d.slots[0].next, utc(2026, 10, 21, 10, 10, 0));
+    settle(d, 1);
+    let runs = history.runs(store, "a");
+    assert_eq(runs.len(), 1);
+    assert_eq(runs[0].status, "ok");
+    assert_eq(history.last_fire(store, "a"), Option.Some(utc(2026, 10, 21, 10, 5, 0)));
+    fs.remove_all(dir).unwrap();
+}
+
+@test
+fn overlap_skip_and_queue() {
+    let jobs = job(
+        "s",
+        "* * * * *",
+        "echo s",
+        "overlap = \"skip\""
+    ) + job("q", "* * * * *", "echo q", "overlap = \"queue\"");
+    let (cfg, store, dir) = setup(jobs, "UTC");
+    let t = utc(2026, 10, 21, 10, 0, 30);
+    let d = daemon.new(cfg, store, daemon.virtual_clock(t)).unwrap();
+    // Both look busy when their minute comes.
+    d.slots[0].running = true;
+    d.slots[1].running = true;
+    daemon.tick(d, utc(2026, 10, 21, 10, 1, 0));
+    let skipped = history.runs(store, "s");
+    assert_eq(skipped.len(), 1);
+    assert_eq(skipped[0].status, "skipped");
+    assert(d.slots[1].queued);
+    // When the queued one's run ends, it runs again at once.
+    let fake = history.runs(store, "s")[0];
+    fake.job = "q";
+    fake.status = "ok";
+    daemon.finished(d, fake);
+    assert(!d.slots[1].queued);
+    assert(d.slots[1].running);
+    settle(d, 1);
+    assert_eq(history.runs(store, "q")[0].output.trim(), "q");
+    fs.remove_all(dir).unwrap();
+}
+
+@test
+fn missed_fire_times_are_reported_and_caught_up_once() {
+    let jobs = job(
+        "plain",
+        "0 * * * *",
+        "echo plain",
+        ""
+    ) + job("eager", "0 * * * *", "echo eager", "catch_up = true");
+    let (cfg, store, dir) = setup(jobs, "UTC");
+    let t = utc(2026, 10, 21, 9, 30, 0);
+    let d = daemon.new(cfg, store, daemon.virtual_clock(t)).unwrap();
+    // The machine slept from 09:30 to 13:20: 10:00, 11:00, 12:00 and 13:00 went by.
+    let woke = utc(2026, 10, 21, 13, 20, 0);
+    assert_eq(daemon.tick(d, woke), 1);
+    assert_eq(d.slots[0].next, utc(2026, 10, 21, 14, 0, 0));
+    assert_eq(d.slots[1].next, utc(2026, 10, 21, 14, 0, 0));
+    assert(!d.slots[0].running);
+    assert(d.slots[1].running);
+    settle(d, 1);
+    assert_eq(history.runs(store, "plain").len(), 0);
+    assert_eq(history.runs(store, "eager").len(), 1);
+    fs.remove_all(dir).unwrap();
+}
+
+@test
+fn a_restart_catches_up_from_the_last_fire() {
+    let jobs = job(
+        "eager",
+        "0 3 * * *",
+        "echo eager",
+        "catch_up = true"
+    ) + job("plain", "0 3 * * *", "echo plain", "");
+    let (cfg, store, dir) = setup(jobs, "UTC");
+    history.set_last_fire(store, "eager", utc(2026, 10, 19, 3, 0, 0)).unwrap();
+    history.set_last_fire(store, "plain", utc(2026, 10, 19, 3, 0, 0)).unwrap();
+    // raycron was stopped for two days.
+    let t = utc(2026, 10, 21, 9, 0, 0);
+    let d = daemon.new(cfg, store, daemon.virtual_clock(t)).unwrap();
+    assert_eq(d.slots[0].next, utc(2026, 10, 20, 3, 0, 0));
+    assert_eq(d.slots[1].next, utc(2026, 10, 22, 3, 0, 0));
+    assert_eq(daemon.tick(d, t), 1);
+    settle(d, 1);
+    assert_eq(d.slots[0].next, utc(2026, 10, 22, 3, 0, 0));
+    fs.remove_all(dir).unwrap();
+}
+
+@test
+fn a_daylight_saving_night_in_a_few_seconds() {
+    // The scheduler for real (its loop, its fibers, the stop), with the clock started just before
+    // Madrid's clocks go back: 03:00 CEST becomes 02:00 CET at 01:00 UTC.
+    let zone = if (schedule.load("Europe/Madrid").is_ok()) { "Europe/Madrid" } else { "UTC" };
+    let jobs = job(
+        "every",
+        "* * * * *",
+        "echo every >> ticks.log",
+        ""
+    ) + job("pinned", "0 2 * * *", "echo pinned >> ticks.log", "");
+    let (cfg, store, dir) = setup(jobs, zone);
+    let d = daemon.new(cfg, store, daemon.virtual_clock(utc(2026, 10, 25, 0, 59, 57))).unwrap();
+    let events = d.events;
+    let served: Channel<Result<int, string>> = Channel.bounded(1);
+    spawn(fn() {
+        send(served, daemon.serve(d));
+    });
+    time.sleep(5000);
+    send(events, daemon.Event.Signal(15));
+    assert_eq(recv(served).unwrap(), Result.Ok(0));
+    // 02:00 CET (the second 02:00 of the night): the every-minute job runs, the pinned one, which
+    // already ran at the first 02:00, does not.
+    assert_eq(fs.read_file("${dir}/ticks.log").unwrap().trim(), "every");
+    let s = kv.open(cfg.state).unwrap();
+    assert_eq(history.runs(s, "every").len(), 1);
+    assert_eq(history.runs(s, "pinned").len(), 0);
+    fs.remove_all(dir).unwrap();
+}
+
+@test
+fn a_second_daemon_on_the_same_state_is_refused() {
+    let (cfg, store, dir) = setup(job("a", "@yearly", "echo a", ""), "UTC");
+    let first = daemon.new(cfg, store, daemon.wall_clock()).unwrap();
+    let events = first.events;
+    let served: Channel<Result<int, string>> = Channel.bounded(1);
+    spawn(fn() {
+        send(served, daemon.serve(first));
+    });
+    time.sleep(300);
+    let second = daemon.new(cfg, kv.open(cfg.state).unwrap(), daemon.wall_clock()).unwrap();
+    let r = daemon.serve(second);
+    assert(r.is_err());
+    send(events, daemon.Event.Signal(15));
+    assert_eq(recv(served).unwrap(), Result.Ok(0));
+    fs.remove_all(dir).unwrap();
+}

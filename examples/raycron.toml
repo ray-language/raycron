@@ -1,0 +1,38 @@
+# An example configuration. Try it with:
+#   raycron -c examples/raycron.toml check
+#   raycron -c examples/raycron.toml next 3
+#   RAYCRON_CLOCK=2026-10-25T00:58:00Z raycron -c examples/raycron.toml run
+# (the last one starts the clock just before Madrid's clocks go back; Ctrl-C stops it).
+
+zone = "Europe/Madrid"
+state = "example.state"
+notify = true
+
+# Every minute, in real time: runs in both passes of the repeated hour in October.
+[[job]]
+name = "heartbeat"
+schedule = "* * * * *"
+command = "date >> heartbeat.log"
+
+# Pinned to 02:30: once on both daylight-saving nights (at 03:00 in March, when 02:30 does not
+# exist; at the first 02:30 in October).
+[[job]]
+name = "backup"
+schedule = "30 2 * * *"
+command = ["sh", "-c", "tar -czf backup.tgz notes/ 2>&1"]
+timeout = "10m"
+overlap = "queue"
+catch_up = true
+
+# 09:00 in Santiago de Chile, whatever the zone above says.
+[[job]]
+name = "report"
+schedule = "0 9 * * 1-5"
+zone = "America/Santiago"
+command = ["sh", "-c", "echo weekly report"]
+
+# Fails on purpose: a desktop notification says so.
+[[job]]
+name = "broken"
+schedule = "*/5 * * * *"
+command = ["sh", "-c", "echo 'disk full' >&2; exit 3"]

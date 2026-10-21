@@ -1,0 +1,153 @@
+// Fire times across time zones and daylight-saving changes.
+
+import std/time;
+import cron/cron;
+import schedule;
+
+fn utc(y: int, mo: int, d: int, h: int, mi: int) -> int {
+    time.to_epoch_millis(
+        time.DateTime { year: y, month: mo, day: d, hour: h, minute: mi, second: 0, weekday: 0 }
+    )
+}
+
+fn zone(name: string) -> Option<schedule.Zone> {
+    // Windows has no zoneinfo database: zone tests have nothing to check there.
+    match (schedule.load(name)) {
+        Result.Ok(z) => Option.Some(z),
+        Result.Err(_) => {
+            assert_eq(platform(), "windows");
+            eprint("skipped: no zone ${name}");
+            Option.None
+        },
+    }
+}
+
+fn fires(expr: string, z: schedule.Zone, after: int, n: int) -> [string] {
+    let s = cron.parse(expr).unwrap();
+    schedule.upcoming(s, z, after, n).unwrap().map(fn(t: int) -> string { schedule.show(z, t) })
+}
+
+fn fires_utc(expr: string, z: schedule.Zone, after: int, n: int) -> [int] {
+    schedule.upcoming(cron.parse(expr).unwrap(), z, after, n).unwrap()
+}
+
+@test
+fn utc_is_plain_cron() {
+    let z = schedule.utc();
+    assert_eq(
+        fires("30 2 * * *", z, utc(2026, 10, 21, 0, 0), 2),
+        ["2026-10-21 02:30 UTC", "2026-10-22 02:30 UTC"]
+    );
+    assert_eq(
+        fires("*/20 * * * *", z, utc(2026, 10, 21, 23, 45), 2),
+        ["2026-10-22 00:00 UTC", "2026-10-22 00:20 UTC"]
+    );
+}
+
+@test
+fn local_time_follows_the_zone() {
+    if let Option.Some(z) = zone("Europe/Madrid") {
+        // 09:00 in Madrid is 07:00 UTC in summer and 08:00 in winter.
+        let summer = fires_utc("0 9 * * *", z, utc(2026, 7, 1, 0, 0), 1);
+        assert_eq(summer, [utc(2026, 7, 1, 7, 0)]);
+        let winter = fires_utc("0 9 * * *", z, utc(2026, 12, 1, 0, 0), 1);
+        assert_eq(winter, [utc(2026, 12, 1, 8, 0)]);
+    }
+    if let Option.Some(k) = zone("Asia/Kolkata") {
+        // +05:30: minute fields are local too.
+        assert_eq(fires_utc("0 * * * *", k, utc(2026, 1, 1, 0, 0), 1), [utc(2026, 1, 1, 0, 30)]);
+    }
+}
+
+@test
+fn a_time_skipped_by_spring_forward_fires_at_the_jump() {
+    if let Option.Some(z) = zone("Europe/Madrid") {
+        // 29 Mar 2026, 02:00 CET jumps to 03:00 CEST (01:00 UTC): 02:30 never happens.
+        assert_eq(
+            fires("30 2 * * *", z, utc(2026, 3, 28, 12, 0), 3),
+            ["2026-03-29 03:00 CEST", "2026-03-30 02:30 CEST", "2026-03-31 02:30 CEST"]
+        );
+        // A job every 15 minutes keeps its pace across the jump.
+        assert_eq(
+            fires("*/15 * * * *", z, utc(2026, 3, 29, 0, 30), 4),
+            [
+                "2026-03-29 01:45 CET",
+                "2026-03-29 03:00 CEST",
+                "2026-03-29 03:15 CEST",
+                "2026-03-29 03:30 CEST"
+            ]
+        );
+        let gaps = fires_utc("*/15 * * * *", z, utc(2026, 3, 29, 0, 30), 4);
+        assert_eq(
+            gaps,
+            [
+                utc(2026, 3, 29, 0, 45),
+                utc(2026, 3, 29, 1, 0),
+                utc(2026, 3, 29, 1, 15),
+                utc(2026, 3, 29, 1, 30)
+            ]
+        );
+    }
+}
+
+@test
+fn a_repeated_time_fires_once_for_a_pinned_hour_and_twice_for_every_hour() {
+    if let Option.Some(z) = zone("Europe/Madrid") {
+        // 25 Oct 2026, 03:00 CEST goes back to 02:00 CET (01:00 UTC): 02:00–02:59 happens twice.
+        assert_eq(
+            fires("30 2 * * *", z, utc(2026, 10, 24, 12, 0), 2),
+            ["2026-10-25 02:30 CEST", "2026-10-26 02:30 CET"]
+        );
+        // Every 30 minutes in real time: both passes of the repeated hour.
+        assert_eq(
+            fires("*/30 * * * *", z, utc(2026, 10, 24, 23, 45), 5),
+            [
+                "2026-10-25 02:00 CEST",
+                "2026-10-25 02:30 CEST",
+                "2026-10-25 02:00 CET",
+                "2026-10-25 02:30 CET",
+                "2026-10-25 03:00 CET"
+            ]
+        );
+        // Pinned to hour 2, every 30 minutes: only the first pass.
+        assert_eq(
+            fires("*/30 2 * * *", z, utc(2026, 10, 24, 23, 45), 3),
+            ["2026-10-25 02:00 CEST", "2026-10-25 02:30 CEST", "2026-10-26 02:00 CET"]
+        );
+    }
+}
+
+@test
+fn midnight_gaps_and_half_hour_shifts() {
+    if let Option.Some(z) = zone("America/Santiago") {
+        // Chile springs forward at midnight (6 Sep 2026): 00:00 does not exist that day.
+        let f = fires("0 0 * * *", z, utc(2026, 9, 4, 12, 0), 3);
+        assert_eq(f[0], "2026-09-05 00:00 -04");
+        assert_eq(f[1], "2026-09-06 01:00 -03");
+        assert_eq(f[2], "2026-09-07 00:00 -03");
+    }
+    if let Option.Some(z) = zone("Australia/Lord_Howe") {
+        // Lord Howe moves by 30 minutes (5 Apr 2026, 02:00 +11 → 01:30 +1030): 01:45 repeats.
+        let f = fires("45 1 * * *", z, utc(2026, 4, 3, 0, 0), 2);
+        assert_eq(f.len(), 2);
+        let every = fires_utc("*/15 * * * *", z, utc(2026, 4, 4, 14, 0), 8);
+        // Fifteen minutes apart in real time, all along.
+        for i in 1..every.len() {
+            assert_eq(every[i] - every[i - 1], 15 * 60000);
+        }
+    }
+}
+
+@test
+fn every_fire_is_after_its_reference_and_increasing() {
+    if let Option.Some(z) = zone("Europe/Madrid") {
+        let s = cron.parse("7,37 0-3 * * *").unwrap();
+        var t = utc(2026, 10, 24, 20, 0);
+        for _ in 0..40 {
+            let n = schedule.next_fire(s, z, t).unwrap();
+            assert(n > t);
+            assert_eq(n % 60000, 0);
+            t = n;
+        }
+    }
+}

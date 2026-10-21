@@ -1,0 +1,403 @@
+//! The scheduler: one fiber that owns the configuration, the state file and every job's next
+//! fire time. Jobs run in their own fibers and report back on the events channel, where OS
+//! signals also arrive (SIGTERM/SIGINT stop, SIGHUP reloads the configuration).
+//!
+//! It never sleeps more than `MAX_NAP_MS` at a time and compares the wall clock with how long it
+//! meant to sleep: a laptop that slept (or a clock that was changed) shows up as a jump. Fire
+//! times missed by more than `LATE_MS` are reported, and run once if the job has `catch_up`.
+
+import std/fs;
+import std/kv;
+import std/process;
+import std/time;
+import std/ui;
+import config;
+import history;
+import runner;
+import schedule;
+from config import Config, Job;
+from runner import Run;
+
+pub const MAX_NAP_MS: int = 30000;
+
+pub const LATE_MS: int = 60000;
+
+pub enum Event {
+    Done(Run),
+    Signal(int),
+}
+
+pub struct Slot {
+    job: Job,
+    next: int,
+    running: bool,
+    queued: bool,
+}
+
+/// The scheduler's clock: the wall clock, or a virtual one that starts at a given instant and
+/// runs at real speed (`RAYCRON_CLOCK`, for tests and demos of a daylight-saving night).
+pub struct Clock {
+    start: int,
+    mono0: int,
+    is_virtual: bool,
+}
+
+pub fn wall_clock() -> Clock {
+    Clock { start: 0, mono0: 0, is_virtual: false }
+}
+
+pub fn virtual_clock(start_ms: int) -> Clock {
+    Clock { start: start_ms, mono0: time.monotonic(), is_virtual: true }
+}
+
+pub fn now(c: Clock) -> int {
+    if (c.is_virtual) { c.start + (time.monotonic() - c.mono0) } else { time.now() }
+}
+
+pub struct Daemon {
+    cfg: Config,
+    store: kv.Store,
+    slots: [Slot],
+    events: Channel<Event>,
+    stop: Channel<int>,
+    clock: Clock,
+    failures: int,
+    notify_ok: bool,
+}
+
+fn log(d: Daemon, msg: string) {
+    let t = now(d.clock);
+    let secs = (schedule.civil(d.cfg.zone, t) / 1000) % 60;
+    let ss = if (secs < 10) { "0${secs}" } else { to_string(secs) };
+    let stamp = schedule.show(d.cfg.zone, t);
+    // "2026-10-25 02:30 CET" → "2026-10-25 02:30:05 CET"
+    let at = stamp.index_of(" ").unwrap_or(0) + 6;
+    eprint("${stamp.substring(0, at)}:${ss}${stamp.substring(at, stamp.len())}  ${msg}");
+}
+
+/// Where each job starts: the next fire after now, or, for a `catch_up` job whose last fire is
+/// known, the first one after that (which may already be due).
+fn first_next(j: Job, store: kv.Store, t: int) -> Result<int, string> {
+    if (j.catch_up) {
+        if let Option.Some(last) = history.last_fire(store, j.name) {
+            return schedule.next_fire(j.schedule, j.zone, last);
+        }
+    }
+    schedule.next_fire(j.schedule, j.zone, t)
+}
+
+pub fn new(cfg: Config, store: kv.Store, clock: Clock) -> Result<Daemon, string> {
+    let t = now(clock);
+    let slots: [Slot] = [];
+    for j in cfg.jobs {
+        slots.push(Slot { job: j, next: first_next(j, store, t)?, running: false, queued: false });
+    }
+    let events: Channel<Event> = Channel.bounded(64);
+    let stop: Channel<int> = Channel.bounded(1);
+    Result.Ok(
+        Daemon {
+            cfg: cfg,
+            store: store,
+            slots: slots,
+            events: events,
+            stop: stop,
+            clock: clock,
+            failures: 0,
+            notify_ok: true
+        }
+    )
+}
+
+fn run_job(
+    name: string,
+    command: [string],
+    dir: string,
+    timeout: int,
+    start: int,
+    stop: Channel<int>,
+    events: Channel<Event>
+) {
+    send(events, Event.Done(runner.run(name, command, dir, timeout, start, stop)));
+}
+
+fn start(d: Daemon, s: Slot, t: int) {
+    s.running = true;
+    let j = s.job;
+    let name = j.name;
+    let command = j.command;
+    let dir = j.dir;
+    let timeout = j.timeout_ms;
+    let stop = d.stop;
+    let events = d.events;
+    spawn(fn() {
+        run_job(name, command, dir, timeout, t, stop, events);
+    });
+    log(d, "${name}: started (${join(command, " ")})");
+}
+
+/// A fire time came: start the job, or apply its overlap policy.
+fn fire(d: Daemon, s: Slot, scheduled: int, t: int) {
+    match (history.set_last_fire(d.store, s.job.name, scheduled)) {
+        Result.Ok(_) => { },
+        Result.Err(e) => log(d, "state: ${e}"),
+    }
+    if (!s.running) {
+        start(d, s, t);
+        return;
+    }
+    if (s.job.overlap == "queue") {
+        s.queued = true;
+        log(d, "${s.job.name}: still running, queued");
+    } else {
+        log(d, "${s.job.name}: still running, skipped");
+        let skipped = Run {
+            job: s.job.name,
+            start_ms: t,
+            end_ms: t,
+            status: "skipped",
+            code: 0,
+            output: ""
+        };
+        let _ = history.record(d.store, skipped);
+    }
+}
+
+/// How many fire times fall in (from, to], counting up to `cap`.
+fn count_fires(s: Slot, from: int, to: int, cap: int) -> int {
+    var n = 0;
+    var t = from;
+    while (n < cap) {
+        match (schedule.next_fire(s.job.schedule, s.job.zone, t)) {
+            Result.Ok(next) => {
+                if (next > to) {
+                    break;
+                }
+                n = n + 1;
+                t = next;
+            },
+            Result.Err(_) => break,
+        }
+    }
+    n
+}
+
+/// Fires everything that is due at `t`. Returns how many jobs fired.
+pub fn tick(d: Daemon, t: int) -> int {
+    var fired = 0;
+    for s in d.slots {
+        if (s.next > t) {
+            continue;
+        }
+        let due = s.next;
+        if (t - due > LATE_MS) {
+            // Missed while the machine slept or raycron was stopped.
+            let missed = 1 + count_fires(s, due, t, 1000);
+            let what = if (missed == 1) { "1 fire time" } else { "${missed} fire times" };
+            if (s.job.catch_up) {
+                log(
+                    d,
+                    "${s.job.name}: missed ${what} since ${schedule.show(s.job.zone, due)}; catching up once"
+                );
+                fire(d, s, due, t);
+                fired = fired + 1;
+            } else {
+                log(d, "${s.job.name}: missed ${what} since ${schedule.show(s.job.zone, due)}");
+            }
+            s.next = schedule.next_fire(s.job.schedule, s.job.zone, t)
+                .unwrap_or(t + time.days(3650));
+        } else {
+            fire(d, s, due, t);
+            fired = fired + 1;
+            s.next = schedule.next_fire(s.job.schedule, s.job.zone, due)
+                .unwrap_or(t + time.days(3650));
+        }
+    }
+    fired
+}
+
+fn slot_of(d: Daemon, name: string) -> Option<Slot> {
+    for s in d.slots {
+        if (s.job.name == name) {
+            return Option.Some(s);
+        }
+    }
+    Option.None
+}
+
+fn notify(d: Daemon, r: Run) {
+    if (!d.cfg.notify || !d.notify_ok) {
+        return;
+    }
+    let lines = r.output.trim().split("\n");
+    let last = if (lines.len() > 0) { lines[lines.len() - 1] } else { "" };
+    let what = if (r.status == "failed") { "exit ${r.code}" } else { r.status };
+    match (ui.notify_with("raycron: ${r.job} failed", "${what}. ${last}", r.job, false)) {
+        Result.Ok(_) => { },
+        Result.Err(e) => {
+            // Say it once (Windows has no notifications yet), then keep quiet.
+            log(d, "notifications unavailable: ${e}");
+            d.notify_ok = false;
+        },
+    }
+    let _ = ui.badge(to_string(d.failures));
+}
+
+/// A job ended: record it, tell the user if it failed, run it again if it was queued.
+pub fn finished(d: Daemon, r: Run) {
+    let secs = (r.end_ms - r.start_ms) / 1000;
+    let detail = if (r.status == "ok") { "" } else { " (${r.status}, code ${r.code})" };
+    log(d, "${r.job}: ${if (r.status == "ok") { "done" } else { "FAILED" }} in ${secs} s${detail}");
+    match (history.record(d.store, r)) {
+        Result.Ok(_) => { },
+        Result.Err(e) => log(d, "state: ${e}"),
+    }
+    if (r.status != "ok" && r.status != "stopped" && r.status != "skipped") {
+        d.failures = d.failures + 1;
+        notify(d, r);
+    }
+    if let Option.Some(s) = slot_of(d, r.job) {
+        s.running = false;
+        if (s.queued) {
+            s.queued = false;
+            log(d, "${r.job}: running the queued fire");
+            start(d, s, now(d.clock));
+        }
+    }
+}
+
+/// Re-reads the configuration: jobs that kept their schedule and zone keep their next fire
+/// time; new or changed ones start from now; removed ones are dropped (a run in flight ends).
+pub fn reload(d: Daemon) {
+    match (config.load(d.cfg.path)) {
+        Result.Err(e) => log(d, "reload failed, keeping the old configuration: ${e}"),
+        Result.Ok(cfg) => {
+            let t = now(d.clock);
+            let slots: [Slot] = [];
+            for j in cfg.jobs {
+                let kept = match (slot_of(d, j.name)) {
+                    Option.Some(old) => if (old.job.expr == j.expr && old.job.zone.name == j.zone.name) {
+                        Option.Some(
+                            Slot {
+                                job: j,
+                                next: old.next,
+                                running: old.running,
+                                queued: old.queued
+                            }
+                        )
+                    } else {
+                        Option.None
+                    },
+                    Option.None => Option.None,
+                };
+                match (kept) {
+                    Option.Some(s) => slots.push(s),
+                    Option.None => match (schedule.next_fire(j.schedule, j.zone, t)) {
+                        Result.Ok(n) => slots.push(Slot { job: j, next: n, running: false, queued: false }),
+                        Result.Err(e) => log(d, "${j.name}: ${e}"),
+                    },
+                }
+            }
+            d.cfg = cfg;
+            d.slots = slots;
+            log(d, "configuration reloaded: ${slots.len()} jobs");
+        },
+    }
+}
+
+fn forward_signals(events: Channel<Event>) {
+    let sigs = signals();
+    while (true) {
+        match (recv(sigs)) {
+            Option.Some(n) => send(events, Event.Signal(n)),
+            Option.None => break,
+        }
+    }
+}
+
+fn running_count(d: Daemon) -> int {
+    d.slots.filter(fn(s: Slot) -> bool { s.running }).len()
+}
+
+/// Stops: no more fires, running jobs get SIGTERM (then SIGKILL), their runs are recorded.
+fn shutdown(d: Daemon) {
+    log(d, "stopping");
+    close(d.stop);
+    var left = running_count(d);
+    while (left > 0) {
+        match (select_timeout([d.events], 10000)) {
+            Option.Some(_) => match (recv(d.events)) {
+                Option.Some(Event.Done(r)) => {
+                    finished(d, r);
+                    left = running_count(d);
+                },
+                _ => { },
+            },
+            Option.None => {
+                log(d, "${left} job(s) did not stop in time");
+                break;
+            },
+        }
+    }
+}
+
+/// Runs until SIGTERM/SIGINT. The lock on `<state>.lock` keeps a second daemon off the same state.
+pub fn serve(d: Daemon) -> Result<int, string> {
+    let lock = fs.open("${d.cfg.state}.lock", "w")?;
+    if (!fs.try_lock(lock)?) {
+        close(lock);
+        return Result.Err("another raycron is running with ${d.cfg.state}");
+    }
+    let _ = process.listen_signal(process.SIGHUP);
+    let events = d.events;
+    spawn(fn() {
+        forward_signals(events);
+    });
+    log(d, "raycron: ${d.slots.len()} jobs, zone ${d.cfg.zone.name}, state ${d.cfg.state}");
+    for s in d.slots {
+        log(d, "${s.job.name}: next ${schedule.show(s.job.zone, s.next)}");
+    }
+    var before = now(d.clock);
+    var nap = 0;
+    while (true) {
+        let t = now(d.clock);
+        let drift = t - (before + nap);
+        if (drift > 5000) {
+            log(
+                d,
+                "the clock jumped ${drift / 1000} s ahead (the machine slept, or the clock was changed)"
+            );
+        } else if (drift < -5000) {
+            log(d, "the clock went back ${-drift / 1000} s; fire times stay where they were");
+        }
+        tick(d, t);
+        var soonest = t + MAX_NAP_MS;
+        for s in d.slots {
+            if (s.next < soonest) {
+                soonest = s.next;
+            }
+        }
+        before = now(d.clock);
+        nap = if (soonest - before < 0) { 0 } else { soonest - before };
+        match (select_timeout([d.events], nap)) {
+            Option.Some(_) => {
+                // An event cut the nap short: measure drift from here, not from the plan.
+                nap = 0;
+                match (recv(d.events)) {
+                    Option.Some(Event.Done(r)) => finished(d, r),
+                    Option.Some(Event.Signal(n)) => {
+                        if (n == process.SIGHUP) {
+                            reload(d);
+                        } else if (n == 15 || n == 2) {
+                            shutdown(d);
+                            close(lock);
+                            return Result.Ok(0);
+                        }
+                    },
+                    Option.None => { },
+                }
+                before = now(d.clock);
+            },
+            Option.None => { },
+        }
+    }
+}

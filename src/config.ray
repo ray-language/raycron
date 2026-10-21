@@ -1,0 +1,216 @@
+//! The configuration: a TOML file with global settings and one `[[job]]` table per job.
+//!
+//!   zone = "Europe/Madrid"          # default: the system's zone
+//!   state = "raycron.state"         # history and lock, next to the config by default
+//!   notify = true                   # desktop notification when a job fails
+//!
+//!   [[job]]
+//!   name = "backup"
+//!   schedule = "30 2 * * *"
+//!   command = ["rsync", "-a", "src/", "dst/"]
+//!   zone = "America/Santiago"       # optional, per job
+//!   dir = "/srv"                    # optional working directory
+//!   timeout = "10m"                 # default 1h; s, m, h
+//!   overlap = "skip"                # or "queue": what to do if it is still running
+//!   catch_up = true                 # run once if fire times were missed (asleep, stopped)
+
+import std/fs;
+import std/time;
+import std/toml;
+import cron/cron;
+import schedule;
+from std/toml import TomlValue;
+
+pub struct Job {
+    name: string,
+    expr: string,
+    schedule: cron.Schedule,
+    zone: schedule.Zone,
+    command: [string],
+    dir: string,
+    timeout_ms: int,
+    overlap: string,
+    catch_up: bool,
+}
+
+pub struct Config {
+    path: string,
+    zone: schedule.Zone,
+    state: string,
+    notify: bool,
+    jobs: [Job],
+}
+
+/// `90s`, `10m`, `2h` or a number of seconds.
+pub fn parse_duration(s: string) -> Result<int, string> {
+    let bad = "not a duration: '${s}' (use 90s, 10m or 2h)";
+    if (s.len() == 0) {
+        return Result.Err(bad);
+    }
+    let unit = s[s.len() - 1];
+    let digits = if (unit == 's' || unit == 'm' || unit == 'h') {
+        s.substring(0, s.len() - 1)
+    } else {
+        s
+    };
+    let n = parse_int(digits).ok_or(bad)?;
+    if (n <= 0) {
+        return Result.Err(bad);
+    }
+    match (unit) {
+        'm' => Result.Ok(time.minutes(n)),
+        'h' => Result.Ok(time.hours(n)),
+        _ => Result.Ok(time.seconds(n)),
+    }
+}
+
+fn str_at(entries: [toml.TomlEntry], key: string) -> Result<Option<string>, string> {
+    match (toml.toml_get(entries, key)) {
+        Option.Some(TomlValue.TStr(s)) => Result.Ok(Option.Some(s)),
+        Option.Some(_) => Result.Err("${key}: expected a string"),
+        Option.None => Result.Ok(Option.None),
+    }
+}
+
+fn bool_at(entries: [toml.TomlEntry], key: string, default: bool) -> Result<bool, string> {
+    match (toml.toml_get(entries, key)) {
+        Option.Some(TomlValue.TBool(b)) => Result.Ok(b),
+        Option.Some(_) => Result.Err("${key}: expected true or false"),
+        Option.None => Result.Ok(default),
+    }
+}
+
+fn strings_at(entries: [toml.TomlEntry], key: string) -> Result<[string], string> {
+    match (toml.toml_get(entries, key)) {
+        Option.Some(TomlValue.TArray(items)) => {
+            let out: [string] = [];
+            for it in items {
+                match (it) {
+                    TomlValue.TStr(s) => out.push(s),
+                    _ => return Result.Err("${key}: expected an array of strings"),
+                }
+            }
+            Result.Ok(out)
+        },
+        // A plain string runs through the shell.
+        Option.Some(TomlValue.TStr(s)) => Result.Ok(["sh", "-c", s]),
+        Option.Some(_) => Result.Err("${key}: expected an array of strings"),
+        Option.None => Result.Err("${key}: missing"),
+    }
+}
+
+/// `/x`, `\\x` or `C:\\x` (Windows).
+fn is_absolute(p: string) -> bool {
+    p.starts_with("/") || p.starts_with("\\") || (p.len() >= 2 && p[1] == ':')
+}
+
+fn dir_of(path: string) -> string {
+    match (path.replace("\\", "/").last_index_of("/")) {
+        Option.Some(i) => path.substring(0, i),
+        Option.None => ".",
+    }
+}
+
+const KNOWN: [string] = ["zone", "state", "notify"];
+
+const KNOWN_JOB: [string] = [
+    "name",
+    "schedule",
+    "command",
+    "zone",
+    "dir",
+    "timeout",
+    "overlap",
+    "catch_up"
+];
+
+/// Parses a configuration; `path` is where it was read from (relative paths start there).
+pub fn parse(src: string, path: string) -> Result<Config, string> {
+    let entries = toml.parse_toml(src).map_err(fn(e: string) -> string { "${path}: ${e}" })?;
+    // Unknown keys are typos: say so instead of ignoring them.
+    for e in entries {
+        let parts = e.key.split(".");
+        let known = if (parts[0] == "job" && parts.len() == 3) {
+            KNOWN_JOB.contains(parts[2])
+        } else {
+            parts.len() == 1 && KNOWN.contains(parts[0])
+        };
+        if (!known) {
+            return Result.Err("${path}: unknown setting '${e.key}'");
+        }
+    }
+    let zone = match (str_at(entries, "zone")?) {
+        Option.Some(name) => schedule.load(name).map_err(fn(e: string) -> string { "zone: ${e}" })?,
+        Option.None => schedule.system(),
+    };
+    let base = dir_of(path);
+    let state = match (str_at(entries, "state")?) {
+        Option.Some(s) => if (is_absolute(s)) { s } else { "${base}/${s}" },
+        Option.None => "${base}/raycron.state",
+    };
+    let jobs: [Job] = [];
+    let names: Map<string, bool> = Map.new();
+    for i in 0..toml.toml_array_len(entries, "job") {
+        let p = "job.${i}";
+        let name = str_at(entries, "${p}.name")?.ok_or("job ${i + 1}: missing name")?;
+        if (names.contains_key(name)) {
+            return Result.Err("job '${name}' is defined twice");
+        }
+        names.insert(name, true);
+        let ctx = fn(e: string) -> string { "job '${name}': ${e}" };
+        let expr = str_at(entries, "${p}.schedule").map_err(ctx)?.ok_or(
+            "job '${name}': missing schedule"
+        )?;
+        let sched = cron.parse(expr).map_err(ctx)?;
+        // An expression that never fires (31 February) is an error now, not a silent job.
+        cron.next_after(sched, 0).map_err(ctx)?;
+        let job_zone = match (str_at(entries, "${p}.zone").map_err(ctx)?) {
+            Option.Some(z) => schedule.load(z).map_err(ctx)?,
+            Option.None => zone,
+        };
+        let command = strings_at(entries, "${p}.command").map_err(ctx)?;
+        if (command.len() == 0) {
+            return Result.Err("job '${name}': empty command");
+        }
+        let overlap = str_at(entries, "${p}.overlap").map_err(ctx)?.unwrap_or("skip");
+        if (overlap != "skip" && overlap != "queue") {
+            return Result.Err(
+                "job '${name}': overlap must be \"skip\" or \"queue\", not \"${overlap}\""
+            );
+        }
+        let timeout = match (str_at(entries, "${p}.timeout").map_err(ctx)?) {
+            Option.Some(t) => parse_duration(t).map_err(ctx)?,
+            Option.None => time.hours(1),
+        };
+        let dir = match (str_at(entries, "${p}.dir").map_err(ctx)?) {
+            Option.Some(d) => if (is_absolute(d)) { d } else { "${base}/${d}" },
+            Option.None => base,
+        };
+        jobs.push(
+            Job {
+                name: name,
+                expr: expr,
+                schedule: sched,
+                zone: job_zone,
+                command: command,
+                dir: dir,
+                timeout_ms: timeout,
+                overlap: overlap,
+                catch_up: bool_at(entries, "${p}.catch_up", false).map_err(ctx)?
+            }
+        );
+    }
+    Result.Ok(
+        Config {
+            path: path,
+            zone: zone,
+            state: state,
+            notify: bool_at(entries, "notify", true)?,
+            jobs: jobs
+        }
+    )
+}
+
+pub fn load(path: string) -> Result<Config, string> {
+    parse(fs.read_file(path).map_err(fn(e: string) -> string { "${path}: ${e}" })?, path)
+}

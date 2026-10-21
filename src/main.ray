@@ -1,0 +1,171 @@
+//! raycron: cron jobs in your time zone, with history and desktop notifications.
+//!
+//!   raycron run              the scheduler (until SIGTERM/SIGINT; SIGHUP reloads)
+//!   raycron check            validate the configuration and show each job's next fire
+//!   raycron next [N]         the next N fire times of every job (default 5)
+//!   raycron explain EXPR [ZONE] [N]   the next fire times of an expression
+//!   raycron now JOB          run a job once, right away, and record it
+//!   raycron history [JOB]    the last runs
+
+import std/kv;
+import std/time;
+import cron/cron;
+import config;
+import daemon;
+import history;
+import runner;
+import schedule;
+
+const VERSION: string = "0.1.0";
+
+const USAGE: string = `usage: raycron [-c CONFIG] COMMAND
+  run                     run the scheduler (SIGTERM/SIGINT stop it, SIGHUP reloads the config)
+  check                   validate the configuration; show each job's next fire time
+  next [N]                the next N fire times of every job (default 5)
+  explain EXPR [ZONE] [N] the next N fire times of a cron expression (default: system zone, 10)
+  now JOB                 run a job once, right away, and record it in the history
+  history [JOB]           the last runs (of every job, or all of one)
+
+CONFIG defaults to ./raycron.toml. RAYCRON_CLOCK=<ISO 8601 instant> starts the scheduler's clock
+there (it then runs at real speed): to watch a daylight-saving night in a few seconds.`;
+
+fn clock() -> Result<daemon.Clock, string> {
+    match (env("RAYCRON_CLOCK")) {
+        Option.Some(iso) => {
+            let dt = time.parse_iso8601(iso)
+                .map_err(fn(e: string) -> string { "RAYCRON_CLOCK: ${e}" })?;
+            Result.Ok(daemon.virtual_clock(time.to_epoch_millis(dt)))
+        },
+        Option.None => Result.Ok(daemon.wall_clock()),
+    }
+}
+
+fn show_next(cfg: config.Config, n: int, t: int) -> Result<int, string> {
+    for j in cfg.jobs {
+        print("${j.name}  ${j.expr}  (${j.zone.name})");
+        for f in schedule.upcoming(j.schedule, j.zone, t, n)? {
+            print("    ${schedule.show(j.zone, f)}");
+        }
+    }
+    Result.Ok(0)
+}
+
+fn duration(ms: int) -> string {
+    if (ms < 60000) { "${ms / 1000} s" } else { "${ms / 60000} min ${(ms % 60000) / 1000} s" }
+}
+
+fn show_run(cfg: config.Config, r: runner.Run, full: bool) {
+    let code = if (r.status == "ok" || r.status == "skipped") { "" } else { " code ${r.code}" };
+    print(
+        "${schedule.show(cfg.zone, r.start_ms)}  ${r.job}  ${r.status}${code}  ${duration(r.end_ms - r.start_ms)}"
+    );
+    if (full && r.output.trim() != "") {
+        for line in r.output.trim().split("\n") {
+            print("    | ${line}");
+        }
+    }
+}
+
+fn run(argv: [string]) -> Result<int, string> {
+    var path = "raycron.toml";
+    let rest: [string] = [];
+    var i = 0;
+    while (i < argv.len()) {
+        if (argv[i] == "-c" && i + 1 < argv.len()) {
+            path = argv[i + 1];
+            i = i + 1;
+        } else {
+            rest.push(argv[i]);
+        }
+        i = i + 1;
+    }
+    if (rest.len() == 0) {
+        return Result.Err(USAGE);
+    }
+    let cmd = rest[0];
+    if (cmd == "--version") {
+        print("raycron ${VERSION}");
+        return Result.Ok(0);
+    }
+    if (cmd == "explain") {
+        if (rest.len() < 2) {
+            return Result.Err("explain needs a cron expression");
+        }
+        let s = cron.parse(rest[1])?;
+        let z = if (rest.len() > 2) { schedule.load(rest[2])? } else { schedule.system() };
+        let n = if (rest.len() > 3) {
+            parse_int(rest[3]).ok_or("not a number: ${rest[3]}")?
+        } else {
+            10
+        };
+        let c = clock()?;
+        for f in schedule.upcoming(s, z, daemon.now(c), n)? {
+            print(schedule.show(z, f));
+        }
+        return Result.Ok(0);
+    }
+    let cfg = config.load(path)?;
+    match (cmd) {
+        "check" => {
+            print("${path}: ${cfg.jobs.len()} jobs, zone ${cfg.zone.name}, state ${cfg.state}");
+            show_next(cfg, 1, daemon.now(clock()?))
+        },
+        "next" => {
+            let n = if (rest.len() > 1) {
+                parse_int(rest[1]).ok_or("not a number: ${rest[1]}")?
+            } else {
+                5
+            };
+            show_next(cfg, n, daemon.now(clock()?))
+        },
+        "run" => {
+            let store = kv.open(cfg.state)?;
+            let d = daemon.new(cfg, store, clock()?)?;
+            daemon.serve(d)
+        },
+        "now" => {
+            if (rest.len() < 2) {
+                return Result.Err("now needs a job name");
+            }
+            let name = rest[1];
+            let found = cfg.jobs.filter(fn(j: config.Job) -> bool { j.name == name });
+            if (found.len() == 0) {
+                return Result.Err("no job named '${name}'");
+            }
+            let j = found[0];
+            let stop: Channel<int> = Channel.bounded(1);
+            let r = runner.run(j.name, j.command, j.dir, j.timeout_ms, daemon.now(clock()?), stop);
+            let store = kv.open(cfg.state)?;
+            history.record(store, r)?;
+            show_run(cfg, r, true);
+            Result.Ok(if (r.status == "ok") { 0 } else { 1 })
+        },
+        "history" => {
+            let store = kv.open(cfg.state)?;
+            if (rest.len() > 1) {
+                for r in history.runs(store, rest[1]) {
+                    show_run(cfg, r, true);
+                }
+            } else {
+                for name in history.jobs(store) {
+                    let rs = history.runs(store, name);
+                    if (rs.len() > 0) {
+                        show_run(cfg, rs[0], false);
+                    }
+                }
+            }
+            Result.Ok(0)
+        },
+        _ => Result.Err("unknown command '${cmd}'\n\n${USAGE}"),
+    }
+}
+
+fn main() -> int {
+    match (run(args())) {
+        Result.Ok(code) => code,
+        Result.Err(e) => {
+            eprint("raycron: ${e}");
+            2
+        },
+    }
+}

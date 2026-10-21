@@ -1,0 +1,136 @@
+//! Running one job: the command as a child process, its output kept to the last few KiB, a
+//! deadline after which its process group is stopped (SIGTERM, then SIGKILL), and a stop channel
+//! for shutdown.
+//!
+//! The child is streamed (`.stream()` + `wait()`), not `.run()`: in a native binary `run` holds
+//! its worker thread until the child exits, so a long job would freeze every fiber on that worker,
+//! the scheduler included. `stream` parks the fiber instead.
+
+import std/process;
+import std/time;
+
+/// How a run ended.
+pub struct Run {
+    job: string,
+    start_ms: int,
+    end_ms: int,
+    /// "ok", "failed" (non-zero exit), "killed" (signal), "timeout", "stopped" (shutdown),
+    /// "error" (could not launch).
+    status: string,
+    code: int,
+    /// The last `TAIL` bytes of stdout and stderr together, as text.
+    output: string,
+}
+
+pub const TAIL: int = 4096;
+
+/// After SIGTERM, how long the job has before SIGKILL.
+const GRACE_MS: int = 3000;
+
+const SLICE_MS: int = 200;
+
+fn keep_tail(acc: bytes, chunk: bytes) -> bytes {
+    let all = bytes_concat([acc, chunk]);
+    if (all.len() > TAIL) { all.sub_bytes(all.len() - TAIL, all.len()) } else { all }
+}
+
+fn text(b: bytes) -> string {
+    match (from_utf8(b)) {
+        Result.Ok(s) => s,
+        // A cut in the middle of a character: drop up to three octets from the front.
+        Result.Err(_) => {
+            var i = 1;
+            var out = "";
+            while (i <= 3 && i < b.len()) {
+                if let Result.Ok(s) = from_utf8(b.sub_bytes(i, b.len())) {
+                    out = s;
+                    break;
+                }
+                i = i + 1;
+            }
+            out
+        },
+    }
+}
+
+/// Runs `command` in `dir` with a deadline. `now` is the scheduler's clock (it may be virtual in
+/// tests); `stop` closing (or receiving) means "shut down now".
+pub fn run(
+    job: string,
+    command: [string],
+    dir: string,
+    timeout_ms: int,
+    start_ms: int,
+    stop: Channel<int>
+) -> Run {
+    let started = time.monotonic();
+    let r = Run {
+        job: job,
+        start_ms: start_ms,
+        end_ms: start_ms,
+        status: "ok",
+        code: 0,
+        output: ""
+    };
+    let args = command.slice(1, command.len());
+    let p = match (process.cmd(command[0], args).dir(dir).merge_output().stream()) {
+        Result.Ok(p) => p,
+        Result.Err(e) => {
+            r.status = "error";
+            r.output = e;
+            return r;
+        },
+    };
+    var tail = b"";
+    var killed_at = -1;
+    var reason = "";
+    var open = true;
+    while (open) {
+        let waited = time.monotonic() - started;
+        if (reason == "") {
+            let stopping = match (try_recv(stop)) {
+                Received.Got(_) => true,
+                Received.Closed => true,
+                Received.Empty => false,
+            };
+            if (stopping) {
+                reason = "stopped";
+            } else if (waited >= timeout_ms) {
+                reason = "timeout";
+            }
+            if (reason != "") {
+                p.kill(false);
+                killed_at = waited;
+            }
+        } else if (killed_at >= 0 && waited - killed_at >= GRACE_MS) {
+            p.kill(true);
+            killed_at = -1;
+        }
+        match (select_timeout([p.out], SLICE_MS)) {
+            Option.Some(_) => match (recv(p.out)) {
+                Option.Some(chunk) => tail = keep_tail(tail, chunk),
+                Option.None => open = false,
+            },
+            Option.None => { },
+        }
+    }
+    let exit = p.wait();
+    r.output = text(tail);
+    r.end_ms = start_ms + (time.monotonic() - started);
+    match (exit) {
+        process.Exit.Code(c) => {
+            r.code = c;
+            if (c != 0) {
+                r.status = "failed";
+            }
+        },
+        process.Exit.Signal(sig) => {
+            r.code = sig;
+            r.status = "killed";
+        },
+    }
+    if (reason != "") {
+        r.status = reason;
+    }
+    r
+}

@@ -1,0 +1,100 @@
+// Running a job: exit codes, the output tail, the deadline and the stop channel.
+
+import std/time;
+import runner;
+
+/// A command line for the platform's shell.
+fn shell(cmd: string) -> [string] {
+    if (platform() == "windows") { ["cmd", "/c", cmd] } else { ["sh", "-c", cmd] }
+}
+
+fn sleeper(secs: int) -> [string] {
+    if (platform() == "windows") {
+        ["ping", "-n", to_string(secs + 1), "127.0.0.1"]
+    } else {
+        ["sleep", to_string(secs)]
+    }
+}
+
+fn go(cmd: [string], timeout: int) -> runner.Run {
+    let stop: Channel<int> = Channel.bounded(1);
+    runner.run("t", cmd, ".", timeout, 1000, stop)
+}
+
+@test
+fn success_and_failure() {
+    let ok = go(shell("echo hello"), 10000);
+    assert_eq(ok.status, "ok");
+    assert_eq(ok.code, 0);
+    assert_eq(ok.output.trim(), "hello");
+    assert_eq(ok.start_ms, 1000);
+    assert(ok.end_ms >= 1000);
+    let bad = go(shell("echo oops 1>&2 && exit 3"), 10000);
+    assert_eq(bad.status, "failed");
+    assert_eq(bad.code, 3);
+    // stderr is merged into the output.
+    assert(bad.output.contains("oops"));
+}
+
+@test
+fn a_command_that_cannot_start() {
+    let r = go(["no-such-program-raycron"], 10000);
+    assert_eq(r.status, "error");
+    assert(r.output != "");
+}
+
+@test
+fn the_output_keeps_its_tail() {
+    let cmd = if (platform() == "windows") {
+        shell("for /L %i in (1,1,2000) do @echo line %i")
+    } else {
+        shell("i=1; while [ $i -le 2000 ]; do echo line $i; i=$((i+1)); done")
+    };
+    let r = go(cmd, 30000);
+    assert_eq(r.status, "ok");
+    assert(r.output.len() <= runner.TAIL);
+    assert(r.output.trim().ends_with("line 2000"));
+    assert(!r.output.contains("line 1\n"));
+}
+
+@test
+fn the_deadline_stops_the_job() {
+    let t0 = time.monotonic();
+    let r = go(sleeper(30), 1000);
+    assert_eq(r.status, "timeout");
+    // SIGTERM ends `sleep` at once; the grace period is the bound.
+    assert(time.monotonic() - t0 < 8000);
+}
+
+@test
+fn closing_the_stop_channel_stops_the_job() {
+    let stop: Channel<int> = Channel.bounded(1);
+    let done: Channel<runner.Run> = Channel.bounded(1);
+    let cmd = sleeper(30);
+    spawn(fn() {
+        send(done, runner.run("t", cmd, ".", 60000, 0, stop));
+    });
+    time.sleep(500);
+    close(stop);
+    let r = recv(done).unwrap();
+    assert_eq(r.status, "stopped");
+}
+
+@test
+fn jobs_run_side_by_side() {
+    // Four jobs of a second each take about a second together: the runner parks its fiber
+    // instead of holding the worker (what `process.run` does in a native binary).
+    let done: Channel<runner.Run> = Channel.bounded(4);
+    let t0 = time.monotonic();
+    for _ in 0..4 {
+        let cmd = sleeper(1);
+        spawn(fn() {
+            let stop: Channel<int> = Channel.bounded(1);
+            send(done, runner.run("t", cmd, ".", 10000, 0, stop));
+        });
+    }
+    for _ in 0..4 {
+        assert_eq(recv(done).unwrap().status, "ok");
+    }
+    assert(time.monotonic() - t0 < 3000);
+}
