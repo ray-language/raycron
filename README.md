@@ -108,7 +108,7 @@ make demo          # el ejemplo durante la noche del cambio de hora de octubre
 | Horarios, configuración, lanzador, programador | **21 tests** en VM y nativo (raylang 1.27.65), también con `RAYLANG_THREADS=1` |
 | Cambios de hora | probados en Madrid (los dos), Santiago (medianoche), Lord Howe (30 min), Kolkata (+5:30) |
 | De punta a punta | el programador real con reloj virtual en la noche de octubre: el job de cada minuto corre a las 02:00 CET (la segunda), el fijado a las 2 no repite; fallo, plazo e historial |
-| Notificación real en macOS | `ui.notify_with` da `Ok` desde el binario nativo sin bundle |
+| Notificación real en macOS | **verificado** (21 oct 2026, macOS 26): desde el binario nativo sin bundle aparece «raycron: demo failed» con «exit 3. disco lleno» y se queda en el Centro de Notificaciones. Como dice la doc, sale a través de `osascript`, con el icono del Editor de Scripts, y el botón «Mostrar» no llega a raycron (el clic solo se recibe dentro de un bundle) |
 | Dormir el portátil de verdad | **sin probar** (la lógica de disparos perdidos está en tests con instantes elegidos) |
 | Windows | en CI; sin zonas (no hay base de zonas, #200): todo en UTC, sin notificaciones ni SIGHUP |
 
