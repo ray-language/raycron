@@ -2,9 +2,9 @@
 //! deadline after which its process group is stopped (SIGTERM, then SIGKILL), and a stop channel
 //! for shutdown.
 //!
-//! The child is streamed (`.stream()` + `wait()`), not `.run()`: in a native binary `run` holds
-//! its worker thread until the child exits, so a long job would freeze every fiber on that worker,
-//! the scheduler included. `stream` parks the fiber instead.
+//! The child is streamed (`.stream()` + `wait()`), not `.run()`: a job must stop when the daemon
+//! shuts down, its output is kept from the END (`run` keeps the beginning), and stdout and stderr
+//! go into one tail.
 
 import std/process;
 import std/time;

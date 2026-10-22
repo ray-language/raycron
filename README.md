@@ -79,10 +79,10 @@ src/history.ray    el estado en std/kv: ejecuciones (JSON) y último disparo
 - **Una fibra programa, otra por job.** El programador duerme hasta el próximo disparo, como mucho
   30 s, en un `select_timeout` sobre su canal de eventos. Ahí llegan los jobs que terminan y las
   señales del sistema, reenviadas por una fibra.
-- **Los jobs se lanzan con `.stream()`, no con `.run()`.** En un binario nativo, `process.run` deja
-  bloqueado su worker hasta que el hijo termina (hallazgo #201). Un job largo congelaría el
-  programador si le tocara el mismo worker. Con `stream()` + `wait()` la fibra aparca, así que
-  raycron se escribe el plazo (SIGTERM, gracia, SIGKILL) y la cola de la salida.
+- **Los jobs se lanzan con `.stream()`, no con `.run()`.** Un job tiene que pararse cuando se
+  apaga el programador, y de su salida interesa el final (lo que `run` recorta es el principio), con
+  stdout y stderr juntos. Así que raycron se escribe el plazo (SIGTERM, gracia, SIGKILL) y la cola
+  de la salida. Hasta raylang 1.27.66, además, `run` dejaba bloqueado su worker en nativo (#201).
 - **Dormir y despertar.** Cada vuelta compara el reloj de pared con lo que pensaba dormir: un salto
   hacia delante (la tapa cerrada) o hacia atrás (alguien cambió la hora) se anota. Los disparos que
   se pasaron por más de un minuto se cuentan y se avisa. Con `catch_up` se ejecutan una vez, y al
@@ -105,27 +105,30 @@ make demo          # el ejemplo durante la noche del cambio de hora de octubre
 
 | Qué | Estado |
 |---|---|
-| Horarios, configuración, lanzador, programador | **21 tests** en VM y nativo (raylang 1.27.65), también con `RAYLANG_THREADS=1` |
+| Horarios, configuración, lanzador, programador | **21 tests** en VM y nativo (raylang 1.27.73, tz 0.2.0), también con `RAYLANG_THREADS=1` |
 | Cambios de hora | probados en Madrid (los dos), Santiago (medianoche), Lord Howe (30 min), Kolkata (+5:30) |
 | De punta a punta | el programador real con reloj virtual en la noche de octubre: el job de cada minuto corre a las 02:00 CET (la segunda), el fijado a las 2 no repite; fallo, plazo e historial |
 | Notificación real en macOS | **verificado** (21 oct 2026, macOS 26): desde el binario nativo sin bundle aparece «raycron: demo failed» con «exit 3. disco lleno» y se queda en el Centro de Notificaciones. Como dice la doc, sale a través de `osascript`, con el icono del Editor de Scripts, y el botón «Mostrar» no llega a raycron (el clic solo se recibe dentro de un bundle) |
 | Dormir el portátil de verdad | **sin probar** (la lógica de disparos perdidos está en tests con instantes elegidos) |
-| Windows | en CI; sin zonas (no hay base de zonas, #200): todo en UTC, sin notificaciones ni SIGHUP |
+| Windows | en CI. Sin base de zonas: con `tz` 0.2.0, sin `zone` se sigue la hora local del sistema (hasta raylang 1.27.73 era UTC, #200), pero una zona con nombre (`Europe/Madrid`) no se puede cargar. Sin notificaciones ni SIGHUP |
 
 Pendiente: notificación al hacer clic (abrir el historial), `overlap = "kill"`, y lanzarlo como
 servicio (launchd/systemd).
 
 ## Hallazgos de dogfood
 
-En `findings/open/raycron-1.27.65.md` del directorio de las apps:
+En `findings/` del directorio de las apps (`open/raycron-1.27.65.md`, y la re-medición en
+`open/raycron-1.27.73.md`):
 
-1. **#201 [B]** `process.run` en una fibra bloquea su worker en nativo hasta que el hijo termina: 4
-   jobs de 1 s tardan 4,1 s con un worker y la fibra principal no avanza. En la VM, 1 s.
-   `stream()` + `wait()` sí aparcan.
-2. **#202 [E]** El paquete `cron` solo calcula en UTC. La hora local, con sus cambios, la pone
-   raycron sobre `tz`.
+1. **#201 [B]** ✅ `process.run` en una fibra bloqueaba su worker en nativo hasta que el hijo
+   terminaba: 4 jobs de 1 s tardaban 4,1 s con un worker. Arreglado en raylang 1.27.66.
+2. **#202 [E]** ⚠️ El paquete `cron` solo calculaba en UTC. `cron` 0.2.0 trae `cron/local` con zona,
+   pero no cumple su política en el cambio de otoño (#226), así que raycron sigue con su
+   `src/schedule.ray`.
+3. **#226 [B]** (con `cron` 0.2.0) `cron/local`, en la noche de otoño: una hora fijada dispara dos
+   veces, `*/15` pierde la segunda pasada y `*/7` en Santiago da `Err`.
 
-Y de rayzip, que también afecta aquí: **#200**, en Windows no hay hora local.
+Y de rayzip, que también afectaba aquí: **#200** ✅, en Windows no había hora local.
 
 Lo que salió bien: `[[job]]` en `std/toml` (arrays de tablas con `toml_array_len`), `std/kv` con
 `save` atómico, `tz` con `Gap`/`Ambiguous` y abreviaturas, `select_timeout` como reloj del

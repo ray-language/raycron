@@ -27,7 +27,8 @@ pub fn load(name: string) -> Result<Zone, string> {
     Result.Ok(Zone { name: name, zone: Option.Some(tz.load(name)?) })
 }
 
-/// The system's zone, or UTC where it cannot be read (Windows has no zoneinfo database).
+/// The system's zone: `TZ`, `/etc/localtime`, or the operating system's own rules (Windows, where
+/// there is no zoneinfo database). UTC only if even that fails.
 pub fn system() -> Zone {
     match (tz.system()) {
         Result.Ok(z) => Zone { name: tz.name(z), zone: Option.Some(z) },
