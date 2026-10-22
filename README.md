@@ -50,8 +50,8 @@ que nunca se cumple (`0 0 31 2 *`).
 
 ## Los cambios de hora
 
-El paquete `cron` calcula en UTC. raycron lee la expresión en la zona con el paquete `tz` y avanza
-por tiempo real:
+raycron lee la expresión en la zona del job con `cron/local` (paquete `cron` 0.2.1, sobre `tz`),
+que sigue esta política:
 
 - **Una hora que no existe** (en primavera, Madrid salta de 02:00 a 03:00): el job de las 02:30 se
   lanza **en el salto**, a las 03:00 CEST, como hace Vixie cron.
@@ -70,7 +70,7 @@ luego corre a velocidad real): la noche del cambio de hora en un par de minutos 
 ```
 src/main.ray       la línea de órdenes
 src/config.ray     el TOML: [[job]], duraciones, validación
-src/schedule.ray   cuándo se dispara un job en su zona (cron + tz, los cambios de hora)
+src/schedule.ray   la zona de un job y cuándo se dispara (cron/local), y cómo se muestra la hora
 src/daemon.ray     el programador: una fibra dueña del estado; señales; reloj; dormir y despertar
 src/runner.ray     un job: proceso hijo, plazo, cola de la salida, parada
 src/history.ray    el estado en std/kv: ejecuciones (JSON) y último disparo
@@ -105,7 +105,7 @@ make demo          # el ejemplo durante la noche del cambio de hora de octubre
 
 | Qué | Estado |
 |---|---|
-| Horarios, configuración, lanzador, programador | **21 tests** en VM y nativo (raylang 1.27.73, tz 0.2.0), también con `RAYLANG_THREADS=1` |
+| Horarios, configuración, lanzador, programador | **21 tests** en VM y nativo (raylang 1.27.75, cron 0.2.1, tz 0.2.0), también con `RAYLANG_THREADS=1` |
 | Cambios de hora | probados en Madrid (los dos), Santiago (medianoche), Lord Howe (30 min), Kolkata (+5:30) |
 | De punta a punta | el programador real con reloj virtual en la noche de octubre: el job de cada minuto corre a las 02:00 CET (la segunda), el fijado a las 2 no repite; fallo, plazo e historial |
 | Notificación real en macOS | **verificado** (21 oct 2026, macOS 26): desde el binario nativo sin bundle aparece «raycron: demo failed» con «exit 3. disco lleno» y se queda en el Centro de Notificaciones. Como dice la doc, sale a través de `osascript`, con el icono del Editor de Scripts, y el botón «Mostrar» no llega a raycron (el clic solo se recibe dentro de un bundle) |
@@ -117,16 +117,18 @@ servicio (launchd/systemd).
 
 ## Hallazgos de dogfood
 
-En `findings/` del directorio de las apps (`open/raycron-1.27.65.md`, y la re-medición en
-`open/raycron-1.27.73.md`):
+En `findings/` del directorio de las apps (`closed/2026-10/raycron-1.27.65.md` y `raycron-1.27.73.md`,
+y la re-medición en `open/raycron-1.27.75.md`):
 
 1. **#201 [B]** ✅ `process.run` en una fibra bloqueaba su worker en nativo hasta que el hijo
    terminaba: 4 jobs de 1 s tardaban 4,1 s con un worker. Arreglado en raylang 1.27.66.
-2. **#202 [E]** ⚠️ El paquete `cron` solo calculaba en UTC. `cron` 0.2.0 trae `cron/local` con zona,
-   pero no cumple su política en el cambio de otoño (#226), así que raycron sigue con su
-   `src/schedule.ray`.
-3. **#226 [B]** (con `cron` 0.2.0) `cron/local`, en la noche de otoño: una hora fijada dispara dos
-   veces, `*/15` pierde la segunda pasada y `*/7` en Santiago da `Err`.
+2. **#202 [E]** ✅ El paquete `cron` solo calculaba en UTC. `cron` 0.2.0 trajo `cron/local`, con zona,
+   y con 0.2.1 cumple la política de raycron en todos los casos. raycron lo usa: su
+   `src/schedule.ray` calculaba los disparos por su cuenta (unas 55 líneas) y ahora llama a
+   `local.next_after_in`.
+3. **#226 [B]** ✅ Con `cron` 0.2.0, en la noche de otoño, una hora fijada disparaba dos veces,
+   `*/15` perdía la segunda pasada y `*/7` en Santiago daba `Err`. Arreglado en `cron` 0.2.1: igual
+   que raycron en seis zonas y diez expresiones durante 2026.
 
 Y de rayzip, que también afectaba aquí: **#200** ✅, en Windows no había hora local.
 

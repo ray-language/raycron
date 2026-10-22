@@ -1,5 +1,5 @@
-//! When a job fires. The `cron` package computes fire times in UTC only; local time comes from
-//! the `tz` package, walking real time and jumping by civil distance:
+//! When a job fires: the `cron` package, with its fields read in a zone from the `tz` package
+//! (`cron/local`). Its DST policy is raycron's:
 //!
 //! - a time that occurs once fires once;
 //! - a time skipped by a spring-forward gap fires at the moment of the jump (as Vixie cron does);
@@ -8,6 +8,7 @@
 
 import std/time;
 import cron/cron;
+import cron/local;
 import tz/tz;
 
 /// Where a schedule's fields are read: an IANA zone, or UTC.
@@ -65,59 +66,12 @@ fn two(n: int) -> string {
     if (n < 10) { "0${n}" } else { to_string(n) }
 }
 
-/// The first instant in (lo, hi] whose civil time is at least `target`, knowing civil(lo) <
-/// target <= civil(hi): the end of a spring-forward gap.
-fn first_reaching(z: Zone, lo: int, hi: int, target: int) -> int {
-    var a = lo;
-    var b = hi;
-    while (b - a > 1000) {
-        let mid = a + (b - a) / 2;
-        if (civil(z, mid) >= target) {
-            b = mid;
-        } else {
-            a = mid;
-        }
-    }
-    // Transitions fall on whole seconds.
-    b - (b % 1000)
-}
-
 /// The next fire time strictly after `after` (epoch ms).
 pub fn next_fire(s: cron.Schedule, z: Zone, after: int) -> Result<int, string> {
-    var low = after;
-    var target = cron.next_after(s, civil(z, after))?;
-    var t = after + (target - civil(z, after));
-    // Each pass either fires or moves `t` forward; offsets change at most a few times a year, so
-    // this settles in a few passes. The bound only guards against a broken zone.
-    for _ in 0..64 {
-        let c = civil(z, t);
-        if (c == target && t > after) {
-            return Result.Ok(t);
-        }
-        if (c > target) {
-            // The target civil time was skipped: fire when the clock jumps over it.
-            let at = first_reaching(z, low, t, target);
-            if (at > after) {
-                return Result.Ok(at);
-            }
-            target = cron.next_after(s, c)?;
-            low = t;
-            t = t + (target - c);
-        } else if (c < target) {
-            // The offset dropped on the way (fall-back): civil time went back, so the first match
-            // at or after `c` may be earlier than `target`. For a job pinned to an hour, the jump
-            // that got here already passed the repeated hour; one that runs every hour finds its
-            // next minute inside it.
-            target = cron.next_after(s, c - 1)?;
-            low = t;
-            t = t + (target - c);
-        } else {
-            target = cron.next_after(s, c)?;
-            low = t;
-            t = t + (target - c);
-        }
+    match (z.zone) {
+        Option.Some(zz) => local.next_after_in(s, zz, after),
+        Option.None => cron.next_after(s, after),
     }
-    Result.Err("no fire time found after ${after} (zone ${z.name})")
 }
 
 /// The next `n` fire times after `after`.

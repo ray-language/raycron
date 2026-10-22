@@ -2,8 +2,8 @@
 name = "raycron"
 version = "0.1.0"
 license = "Apache-2.0"
-raylang = "1.27.73"
+raylang = "1.27.75"
 
 [dependencies]
-cron = "^0.1.0"
+cron = "^0.2.1"
 tz = "^0.2.0"

@@ -3,9 +3,9 @@
 
 [cron]
 url = "https://github.com/ray-language/cron"
-ref = "v0.1.0"
-commit = "81c17cf6e255cb7d8a86a03d475c1f609871b920"
-hash = "sha256:28c86b2cc9157b17a99044b87ff94f1844886e870d4b6a2ca0aabf1ff396cb3e"
+ref = "v0.2.1"
+commit = "d19cb0c7a6b68b2d5b80d823151139a704eca6f1"
+hash = "sha256:7a98d4cb87a37fa9b9b494e8afdf2e478f69d5a0d9b8bc95ce14826bd64cf297"
 
 [tz]
 url = "https://github.com/ray-language/tz"
